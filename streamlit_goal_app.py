@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
+from pathlib import Path
 
 import streamlit as st
 
@@ -135,6 +137,7 @@ PHASES = [
 ]
 
 DAYS = ["M", "T", "W", "T", "F", "S", "S"]
+DATA_FILE = Path(__file__).with_name("goal_progress.json")
 
 
 def days_until(date_str: str) -> int:
@@ -152,9 +155,102 @@ def deadline_label(date_str: str) -> str:
     return f"{abs(delta)}d overdue"
 
 
+def all_task_ids() -> list[str]:
+    return [task["id"] for goal in GOALS for task in goal["tasks"]]
+
+
+def all_habit_day_keys() -> list[str]:
+    return [
+        f"{habit['id']}_{day_index}"
+        for goal in GOALS
+        for habit in goal["habits"]
+        for day_index in range(7)
+    ]
+
+
+def default_data() -> dict:
+    return {
+        "tasks": {task_id: False for task_id in all_task_ids()},
+        "habits": {habit_key: False for habit_key in all_habit_day_keys()},
+        "notes": {},
+        "history": {},
+    }
+
+
+def load_data() -> dict:
+    data = default_data()
+    if DATA_FILE.exists():
+        try:
+            saved = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            data["tasks"].update(saved.get("tasks", {}))
+            data["habits"].update(saved.get("habits", {}))
+            data["notes"] = saved.get("notes", {})
+            data["history"] = saved.get("history", {})
+        except (OSError, json.JSONDecodeError):
+            st.warning("Saved progress could not be read. Starting with a clean local state.")
+    return data
+
+
+def current_progress_snapshot() -> dict:
+    total_tasks = len(all_task_ids())
+    completed_tasks = sum(1 for task_id in all_task_ids() if st.session_state.get(f"task_{task_id}", False))
+    total_habits = len(all_habit_day_keys())
+    completed_habits = sum(
+        1
+        for habit_key in all_habit_day_keys()
+        if st.session_state.get(f"habit_{habit_key}", False)
+    )
+    return {
+        "date": date.today().isoformat(),
+        "completed_tasks": completed_tasks,
+        "total_tasks": total_tasks,
+        "completed_habits": completed_habits,
+        "total_habits": total_habits,
+        "task_percent": round((completed_tasks / total_tasks) * 100) if total_tasks else 0,
+        "habit_percent": round((completed_habits / total_habits) * 100) if total_habits else 0,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def data_from_session() -> dict:
+    data = {
+        "tasks": {task_id: bool(st.session_state.get(f"task_{task_id}", False)) for task_id in all_task_ids()},
+        "habits": {
+            habit_key: bool(st.session_state.get(f"habit_{habit_key}", False))
+            for habit_key in all_habit_day_keys()
+        },
+        "notes": st.session_state.get("notes", {}),
+        "history": st.session_state.get("history", {}),
+    }
+    data["history"][date.today().isoformat()] = current_progress_snapshot()
+    return data
+
+
+def save_progress() -> None:
+    data = data_from_session()
+    st.session_state["history"] = data["history"]
+    try:
+        DATA_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        st.session_state["last_saved_at"] = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    except OSError as exc:
+        st.session_state["last_saved_at"] = f"Save failed: {exc}"
+
+
 def init_state() -> None:
+    if "data_loaded" not in st.session_state:
+        saved = load_data()
+        for task_id, is_done in saved["tasks"].items():
+            st.session_state[f"task_{task_id}"] = bool(is_done)
+        for habit_key, is_done in saved["habits"].items():
+            st.session_state[f"habit_{habit_key}"] = bool(is_done)
+        st.session_state["notes"] = saved["notes"]
+        st.session_state["history"] = saved["history"]
+        st.session_state["data_loaded"] = True
+
     st.session_state.setdefault("view", "Goals")
     st.session_state.setdefault("notes", {})
+    st.session_state.setdefault("history", {})
+    st.session_state.setdefault("last_saved_at", "Not saved yet")
     st.session_state.setdefault("coach_messages", [
         {
             "role": "assistant",
@@ -442,7 +538,7 @@ def render_header() -> None:
         unsafe_allow_html=True,
     )
 
-    views = ["Goals", "Schedule", "Phases", "Coach"]
+    views = ["Goals", "Schedule", "Phases", "Progress", "Coach"]
     st.session_state["view"] = st.segmented_control(
         "View",
         views,
@@ -485,7 +581,7 @@ def render_goal_card(goal: dict) -> None:
         with task_tab:
             st.markdown(f"<div class='mini-label'>Daily time: {goal['dailyTime']}</div>", unsafe_allow_html=True)
             for task in goal["tasks"]:
-                st.checkbox(task["text"], key=f"task_{task['id']}")
+                st.checkbox(task["text"], key=f"task_{task['id']}", on_change=save_progress)
             st.markdown(
                 f"""
                 <div class="target-box" style="background:{goal['bg']};">
@@ -509,6 +605,7 @@ def render_goal_card(goal: dict) -> None:
                         "done",
                         key=f"habit_{habit['id']}_{day_index}",
                         label_visibility="collapsed",
+                        on_change=save_progress,
                     )
             st.caption("Mark each day as complete to build the weekly rhythm.")
 
@@ -529,6 +626,7 @@ def render_goal_card(goal: dict) -> None:
                         {"text": note, "date": date.today().strftime("%d %b %Y")},
                     )
                     st.session_state[note_key] = ""
+                    save_progress()
                     st.rerun()
 
             notes = st.session_state["notes"].get(goal["id"], [])
@@ -567,10 +665,54 @@ def render_dashboard() -> None:
     cols[1].metric("Task progress", f"{total_done}/{total_tasks}")
     cols[2].metric("Daily focus", "3h")
     cols[3].metric("Total runway", "6mo")
+    st.caption(f"Saved progress file: `{DATA_FILE.name}` · Last saved: {st.session_state.get('last_saved_at', 'Not saved yet')}")
 
     st.write("")
     for goal in GOALS:
         render_goal_card(goal)
+
+
+def render_progress() -> None:
+    st.subheader("Progress Record")
+    st.caption("Daily task and habit progress is saved locally and accumulated by date.")
+
+    snapshot = current_progress_snapshot()
+    cols = st.columns(4)
+    cols[0].metric("Tasks done", f"{snapshot['completed_tasks']}/{snapshot['total_tasks']}")
+    cols[1].metric("Task progress", f"{snapshot['task_percent']}%")
+    cols[2].metric("Habits done", f"{snapshot['completed_habits']}/{snapshot['total_habits']}")
+    cols[3].metric("Habit progress", f"{snapshot['habit_percent']}%")
+
+    if st.button("Save today's progress now", use_container_width=True):
+        save_progress()
+        st.success("Today's progress has been saved.")
+        st.rerun()
+
+    st.caption(f"Last saved: {st.session_state.get('last_saved_at', 'Not saved yet')}")
+
+    data = data_from_session()
+    backup_json = json.dumps(data, indent=2)
+    st.download_button(
+        "Download progress backup",
+        data=backup_json,
+        file_name=f"goal_progress_backup_{date.today().isoformat()}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    history = st.session_state.get("history", {})
+    if not history:
+        st.info("No saved daily history yet. Tick a task or habit, or use the save button above.")
+        return
+
+    st.write("")
+    st.markdown("**Daily History**")
+    for day, row in sorted(history.items(), reverse=True):
+        st.markdown(
+            f"- **{day}** · Tasks: {row.get('completed_tasks', 0)}/{row.get('total_tasks', 0)} "
+            f"({row.get('task_percent', 0)}%) · Habits: {row.get('completed_habits', 0)}/{row.get('total_habits', 0)} "
+            f"({row.get('habit_percent', 0)}%)"
+        )
 
 
 def render_schedule() -> None:
@@ -700,6 +842,8 @@ def main() -> None:
         render_schedule()
     elif view == "Phases":
         render_phases()
+    elif view == "Progress":
+        render_progress()
     else:
         render_coach()
 
