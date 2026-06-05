@@ -6,6 +6,13 @@ from pathlib import Path
 
 import streamlit as st
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    gspread = None
+    Credentials = None
+
 
 GOALS = [
     {
@@ -138,6 +145,7 @@ PHASES = [
 
 DAYS = ["M", "T", "W", "T", "F", "S", "S"]
 DATA_FILE = Path(__file__).with_name("goal_progress.json")
+SHEET_TAB = "goal_progress"
 
 
 def days_until(date_str: str) -> int:
@@ -177,8 +185,97 @@ def default_data() -> dict:
     }
 
 
+def google_sheet_configured() -> bool:
+    return (
+        gspread is not None
+        and Credentials is not None
+        and "gcp_service_account" in st.secrets
+        and "google_sheet_id" in st.secrets
+    )
+
+
+def get_goal_worksheet():
+    if not google_sheet_configured():
+        return None
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=scopes,
+    )
+    client = gspread.authorize(credentials)
+    workbook = client.open_by_key(st.secrets["google_sheet_id"])
+    try:
+        worksheet = workbook.worksheet(SHEET_TAB)
+    except gspread.WorksheetNotFound:
+        worksheet = workbook.add_worksheet(title=SHEET_TAB, rows=1000, cols=4)
+        worksheet.update("A1:D1", [["record_type", "record_key", "payload_json", "updated_at"]])
+    return worksheet
+
+
+def data_from_google_sheet() -> dict | None:
+    worksheet = get_goal_worksheet()
+    if worksheet is None:
+        return None
+
+    rows = worksheet.get_all_records()
+    data = default_data()
+    for row in rows:
+        record_type = row.get("record_type")
+        record_key = str(row.get("record_key", ""))
+        payload = row.get("payload_json")
+        if not payload:
+            continue
+        try:
+            value = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            continue
+
+        if record_type == "task" and record_key:
+            data["tasks"][record_key] = bool(value)
+        elif record_type == "habit" and record_key:
+            data["habits"][record_key] = bool(value)
+        elif record_type == "notes":
+            data["notes"] = value if isinstance(value, dict) else {}
+        elif record_type == "history":
+            data["history"] = value if isinstance(value, dict) else {}
+
+    return data
+
+
+def save_to_google_sheet(data: dict) -> bool:
+    worksheet = get_goal_worksheet()
+    if worksheet is None:
+        return False
+
+    rows = [["record_type", "record_key", "payload_json", "updated_at"]]
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    for task_id, is_done in data["tasks"].items():
+        rows.append(["task", task_id, json.dumps(bool(is_done)), updated_at])
+    for habit_key, is_done in data["habits"].items():
+        rows.append(["habit", habit_key, json.dumps(bool(is_done)), updated_at])
+    rows.append(["notes", "all", json.dumps(data["notes"], ensure_ascii=False), updated_at])
+    rows.append(["history", "all", json.dumps(data["history"], ensure_ascii=False), updated_at])
+
+    worksheet.clear()
+    worksheet.update("A1", rows)
+    return True
+
+
 def load_data() -> dict:
     data = default_data()
+    try:
+        sheet_data = data_from_google_sheet()
+        if sheet_data is not None:
+            st.session_state["storage_backend"] = "Google Sheets"
+            return sheet_data
+    except Exception as exc:
+        st.session_state["storage_backend"] = "Local JSON fallback"
+        st.session_state["storage_error"] = f"Google Sheets load failed: {exc}"
+
     if DATA_FILE.exists():
         try:
             saved = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -230,8 +327,17 @@ def save_progress() -> None:
     data = data_from_session()
     st.session_state["history"] = data["history"]
     try:
+        if save_to_google_sheet(data):
+            st.session_state["storage_backend"] = "Google Sheets"
+            st.session_state["last_saved_at"] = f"{datetime.now().strftime('%d %b %Y, %I:%M %p')} to Google Sheets"
+            return
+    except Exception as exc:
+        st.session_state["storage_backend"] = "Local JSON fallback"
+        st.session_state["storage_error"] = f"Google Sheets save failed: {exc}"
+
+    try:
         DATA_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        st.session_state["last_saved_at"] = datetime.now().strftime("%d %b %Y, %I:%M %p")
+        st.session_state["last_saved_at"] = f"{datetime.now().strftime('%d %b %Y, %I:%M %p')} to local JSON"
     except OSError as exc:
         st.session_state["last_saved_at"] = f"Save failed: {exc}"
 
@@ -251,6 +357,8 @@ def init_state() -> None:
     st.session_state.setdefault("notes", {})
     st.session_state.setdefault("history", {})
     st.session_state.setdefault("last_saved_at", "Not saved yet")
+    st.session_state.setdefault("storage_backend", "Google Sheets" if google_sheet_configured() else "Local JSON")
+    st.session_state.setdefault("storage_error", "")
     st.session_state.setdefault("coach_messages", [
         {
             "role": "assistant",
@@ -665,7 +773,12 @@ def render_dashboard() -> None:
     cols[1].metric("Task progress", f"{total_done}/{total_tasks}")
     cols[2].metric("Daily focus", "3h")
     cols[3].metric("Total runway", "6mo")
-    st.caption(f"Saved progress file: `{DATA_FILE.name}` · Last saved: {st.session_state.get('last_saved_at', 'Not saved yet')}")
+    st.caption(
+        f"Storage: {st.session_state.get('storage_backend', 'Local JSON')} · "
+        f"Last saved: {st.session_state.get('last_saved_at', 'Not saved yet')}"
+    )
+    if st.session_state.get("storage_error"):
+        st.warning(st.session_state["storage_error"])
 
     st.write("")
     for goal in GOALS:
@@ -674,7 +787,7 @@ def render_dashboard() -> None:
 
 def render_progress() -> None:
     st.subheader("Progress Record")
-    st.caption("Daily task and habit progress is saved locally and accumulated by date.")
+    st.caption("Daily task and habit progress is saved to Google Sheets when configured, with local JSON as a fallback.")
 
     snapshot = current_progress_snapshot()
     cols = st.columns(4)
@@ -688,7 +801,12 @@ def render_progress() -> None:
         st.success("Today's progress has been saved.")
         st.rerun()
 
-    st.caption(f"Last saved: {st.session_state.get('last_saved_at', 'Not saved yet')}")
+    st.caption(
+        f"Storage: {st.session_state.get('storage_backend', 'Local JSON')} · "
+        f"Last saved: {st.session_state.get('last_saved_at', 'Not saved yet')}"
+    )
+    if st.session_state.get("storage_error"):
+        st.warning(st.session_state["storage_error"])
 
     data = data_from_session()
     backup_json = json.dumps(data, indent=2)
