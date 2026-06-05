@@ -180,9 +180,50 @@ def default_data() -> dict:
     return {
         "tasks": {task_id: False for task_id in all_task_ids()},
         "habits": {habit_key: False for habit_key in all_habit_day_keys()},
+        "daily_logs": {},
         "notes": {},
         "history": {},
     }
+
+
+def today_key() -> str:
+    return date.today().isoformat()
+
+
+def daily_task_state_key(task_id: str, day: str | None = None) -> str:
+    return f"daily_task_{day or today_key()}_{task_id}"
+
+
+def daily_habit_state_key(habit_id: str, day: str | None = None) -> str:
+    return f"daily_habit_{day or today_key()}_{habit_id}"
+
+
+def daily_log_from_session(day: str | None = None) -> dict:
+    day = day or today_key()
+    return {
+        "tasks": {
+            task["id"]: bool(st.session_state.get(daily_task_state_key(task["id"], day), False))
+            for goal in GOALS
+            for task in goal["tasks"]
+        },
+        "habits": {
+            habit["id"]: bool(st.session_state.get(daily_habit_state_key(habit["id"], day), False))
+            for goal in GOALS
+            for habit in goal["habits"]
+        },
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def daily_log_counts(day: str | None = None) -> tuple[int, int, int]:
+    day = day or today_key()
+    log = st.session_state.get("daily_logs", {}).get(day, {})
+    task_values = log.get("tasks", {})
+    habit_values = log.get("habits", {})
+    total = sum(len(goal["tasks"]) + len(goal["habits"]) for goal in GOALS)
+    done = sum(1 for value in task_values.values() if value) + sum(1 for value in habit_values.values() if value)
+    pct = round((done / total) * 100) if total else 0
+    return done, total, pct
 
 
 def google_sheet_configured() -> bool:
@@ -238,6 +279,8 @@ def data_from_google_sheet() -> dict | None:
             data["tasks"][record_key] = bool(value)
         elif record_type == "habit" and record_key:
             data["habits"][record_key] = bool(value)
+        elif record_type == "daily_logs":
+            data["daily_logs"] = value if isinstance(value, dict) else {}
         elif record_type == "notes":
             data["notes"] = value if isinstance(value, dict) else {}
         elif record_type == "history":
@@ -257,6 +300,7 @@ def save_to_google_sheet(data: dict) -> bool:
         rows.append(["task", task_id, json.dumps(bool(is_done)), updated_at])
     for habit_key, is_done in data["habits"].items():
         rows.append(["habit", habit_key, json.dumps(bool(is_done)), updated_at])
+    rows.append(["daily_logs", "all", json.dumps(data["daily_logs"], ensure_ascii=False), updated_at])
     rows.append(["notes", "all", json.dumps(data["notes"], ensure_ascii=False), updated_at])
     rows.append(["history", "all", json.dumps(data["history"], ensure_ascii=False), updated_at])
 
@@ -281,6 +325,7 @@ def load_data() -> dict:
             saved = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             data["tasks"].update(saved.get("tasks", {}))
             data["habits"].update(saved.get("habits", {}))
+            data["daily_logs"] = saved.get("daily_logs", {})
             data["notes"] = saved.get("notes", {})
             data["history"] = saved.get("history", {})
         except (OSError, json.JSONDecodeError):
@@ -297,12 +342,16 @@ def current_progress_snapshot() -> dict:
         for habit_key in all_habit_day_keys()
         if st.session_state.get(f"habit_{habit_key}", False)
     )
+    today_done, today_total, today_percent = daily_log_counts()
     return {
         "date": date.today().isoformat(),
         "completed_tasks": completed_tasks,
         "total_tasks": total_tasks,
         "completed_habits": completed_habits,
         "total_habits": total_habits,
+        "today_done": today_done,
+        "today_total": today_total,
+        "today_percent": today_percent,
         "task_percent": round((completed_tasks / total_tasks) * 100) if total_tasks else 0,
         "habit_percent": round((completed_habits / total_habits) * 100) if total_habits else 0,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -316,9 +365,12 @@ def data_from_session() -> dict:
             habit_key: bool(st.session_state.get(f"habit_{habit_key}", False))
             for habit_key in all_habit_day_keys()
         },
+        "daily_logs": st.session_state.get("daily_logs", {}),
         "notes": st.session_state.get("notes", {}),
         "history": st.session_state.get("history", {}),
     }
+    data["daily_logs"][today_key()] = daily_log_from_session()
+    st.session_state["daily_logs"] = data["daily_logs"]
     data["history"][date.today().isoformat()] = current_progress_snapshot()
     return data
 
@@ -349,12 +401,19 @@ def init_state() -> None:
             st.session_state[f"task_{task_id}"] = bool(is_done)
         for habit_key, is_done in saved["habits"].items():
             st.session_state[f"habit_{habit_key}"] = bool(is_done)
+        st.session_state["daily_logs"] = saved.get("daily_logs", {})
+        today_log = st.session_state["daily_logs"].get(today_key(), {})
+        for task_id, is_done in today_log.get("tasks", {}).items():
+            st.session_state[daily_task_state_key(task_id)] = bool(is_done)
+        for habit_id, is_done in today_log.get("habits", {}).items():
+            st.session_state[daily_habit_state_key(habit_id)] = bool(is_done)
         st.session_state["notes"] = saved["notes"]
         st.session_state["history"] = saved["history"]
         st.session_state["data_loaded"] = True
 
     st.session_state.setdefault("view", "Goals")
     st.session_state.setdefault("notes", {})
+    st.session_state.setdefault("daily_logs", {})
     st.session_state.setdefault("history", {})
     st.session_state.setdefault("last_saved_at", "Not saved yet")
     st.session_state.setdefault("storage_backend", "Google Sheets" if google_sheet_configured() else "Local JSON")
@@ -369,7 +428,9 @@ def init_state() -> None:
     for goal in GOALS:
         for task in goal["tasks"]:
             st.session_state.setdefault(f"task_{task['id']}", False)
+            st.session_state.setdefault(daily_task_state_key(task["id"]), False)
         for habit in goal["habits"]:
+            st.session_state.setdefault(daily_habit_state_key(habit["id"]), False)
             for day_index in range(7):
                 st.session_state.setdefault(f"habit_{habit['id']}_{day_index}", False)
 
@@ -684,7 +745,30 @@ def render_goal_card(goal: dict) -> None:
     )
 
     with st.expander("Open tracker", expanded=False):
-        task_tab, habit_tab, milestone_tab, notes_tab = st.tabs(["Tasks", "Habits", "Milestones", "Notes"])
+        today_tab, task_tab, habit_tab, milestone_tab, notes_tab = st.tabs(["Today", "Tasks", "Habits", "Milestones", "Notes"])
+
+        with today_tab:
+            st.markdown(f"<div class='mini-label'>Daily record for {date.today().strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
+            st.markdown("**Today's tasks**")
+            for task in goal["tasks"]:
+                st.checkbox(
+                    task["text"],
+                    key=daily_task_state_key(task["id"]),
+                    on_change=save_progress,
+                )
+
+            st.markdown("**Today's habits**")
+            for habit in goal["habits"]:
+                st.checkbox(
+                    habit["text"],
+                    key=daily_habit_state_key(habit["id"]),
+                    on_change=save_progress,
+                )
+
+            if st.button("Save today's tracker", key=f"save_today_{goal['id']}", use_container_width=True):
+                save_progress()
+                st.success("Today's tracker has been saved.")
+                st.rerun()
 
         with task_tab:
             st.markdown(f"<div class='mini-label'>Daily time: {goal['dailyTime']}</div>", unsafe_allow_html=True)
@@ -767,11 +851,12 @@ def render_dashboard() -> None:
         done, total, _ = progress_for_goal(goal)
         total_done += done
         total_tasks += total
+    today_done, today_total, today_percent = daily_log_counts()
 
     cols = st.columns(4)
     cols[0].metric("Active goals", "4")
     cols[1].metric("Task progress", f"{total_done}/{total_tasks}")
-    cols[2].metric("Daily focus", "3h")
+    cols[2].metric("Today recorded", f"{today_done}/{today_total}", f"{today_percent}%")
     cols[3].metric("Total runway", "6mo")
     st.caption(
         f"Storage: {st.session_state.get('storage_backend', 'Local JSON')} · "
@@ -791,10 +876,10 @@ def render_progress() -> None:
 
     snapshot = current_progress_snapshot()
     cols = st.columns(4)
-    cols[0].metric("Tasks done", f"{snapshot['completed_tasks']}/{snapshot['total_tasks']}")
-    cols[1].metric("Task progress", f"{snapshot['task_percent']}%")
-    cols[2].metric("Habits done", f"{snapshot['completed_habits']}/{snapshot['total_habits']}")
-    cols[3].metric("Habit progress", f"{snapshot['habit_percent']}%")
+    cols[0].metric("Today recorded", f"{snapshot['today_done']}/{snapshot['today_total']}")
+    cols[1].metric("Today progress", f"{snapshot['today_percent']}%")
+    cols[2].metric("Goal tasks done", f"{snapshot['completed_tasks']}/{snapshot['total_tasks']}")
+    cols[3].metric("Weekly habits done", f"{snapshot['completed_habits']}/{snapshot['total_habits']}")
 
     if st.button("Save today's progress now", use_container_width=True):
         save_progress()
@@ -827,9 +912,9 @@ def render_progress() -> None:
     st.markdown("**Daily History**")
     for day, row in sorted(history.items(), reverse=True):
         st.markdown(
-            f"- **{day}** · Tasks: {row.get('completed_tasks', 0)}/{row.get('total_tasks', 0)} "
-            f"({row.get('task_percent', 0)}%) · Habits: {row.get('completed_habits', 0)}/{row.get('total_habits', 0)} "
-            f"({row.get('habit_percent', 0)}%)"
+            f"- **{day}** · Today: {row.get('today_done', 0)}/{row.get('today_total', 0)} "
+            f"({row.get('today_percent', 0)}%) · Goal tasks: {row.get('completed_tasks', 0)}/{row.get('total_tasks', 0)} "
+            f"· Weekly habits: {row.get('completed_habits', 0)}/{row.get('total_habits', 0)}"
         )
 
 
